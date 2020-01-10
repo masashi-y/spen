@@ -79,26 +79,6 @@ def check_saddle_point(step, y, prev_y, energy, prev_energy):
     return False
 
 
-# @jit
-# def inference(params, x, max_steps=80, step_size=0.1):
-#     x_hat = compute_feature_energy(params, x)
-#     opt_init, opt_update, get_params = momentum(0.1, 0.95)
-#     opt_state = opt_init(np.full(x.shape[:-1] + (LABELS,), 1. / LABELS))
-#     prev_pred_energy = None
-#     for i in range(max_steps):
-#         y_hat = project(get_params(opt_state))
-#         pred_energy, g = value_and_grad(lambda y: compute_global_energy(params, x_hat, y).sum())(y_hat)
-#         opt_state = opt_update(i, g, opt_state)
-#         # if np.all(np.isclose(get_params(opt_state), y_hat)):
-#         #     print('achieve tolerance with y_hat', i)
-#         #     break
-#         # if prev_pred_energy is not None and np.isclose(pred_energy, prev_pred_energy):
-#         #     print('achieve tolerance with energy', i)
-#         #     break
-#         # prev_pred_energy = pred_energy
-#     return get_params(opt_state)
-
-
 def inference(y_hat, y, x_hat, params):
     energy = compute_global_energy(params, x_hat, y_hat)
     return energy.mean(), energy
@@ -112,14 +92,14 @@ def cost_augment_inference(y_hat, y, x_hat, params):
 cost_augmented_inference_step = jit(grad(cost_augment_inference, has_aux=True))
 
 
-def ssvm_loss(params, x, y, lamb=0.001, max_steps=40, step_size=0.1, pretrain_global_energy=False):
+def ssvm_loss(params, x, y, lamb=0.01, max_steps=80, step_size=0.1, pretrain_global_energy=False):
     prediction = y is None
     x_hat = compute_feature_energy(params, x)
     if pretrain_global_energy:
         x_hat = lax.stop_gradient(x_hat)
     grad_fun = inference_step if prediction else cost_augmented_inference_step
 
-    opt_init, opt_update, get_params = momentum(0.1, 0.95)
+    opt_init, opt_update, get_params = momentum(0.01, 0.95)
     # opt_state = opt_init(np.full(x.shape[:-1] + (LABELS,), 1. / LABELS))
     opt_state = opt_init(np.zeros(x.shape[:-1] + (LABELS,)))
     prev_energy = None
@@ -136,6 +116,7 @@ def ssvm_loss(params, x, y, lamb=0.001, max_steps=40, step_size=0.1, pretrain_gl
     if prediction:
         return y_hat
 
+    y = lax.stop_gradient(y)
     pred_energy = compute_global_energy(params, x_hat, y_hat)
     true_energy = compute_global_energy(params, x_hat, y)
     delta = np.square(y_hat - y).sum(axis=1)
@@ -187,18 +168,12 @@ def main(unused_argv):
                              label_units=FLAGS.label_units,
                              hidden_units=FLAGS.hidden_units)
 
-
-    opt_init, opt_update, get_params = adam(0.01)  # momentum(0.1, 0.95)
-    opt_state = opt_init(init_params)
-
-
     @jit
     def update_pretrain(i, opt_state, batch):
         params = get_params(opt_state)
         loss, g = value_and_grad(pretrain_loss)(params, *batch)
         return opt_update(i, g, opt_state), loss
 
-    # @jit
     def update_ssvm(i, opt_state, batch, pretrain_global_energy=False):
         params = get_params(opt_state)
         loss, g = value_and_grad(ssvm_loss)(params, *batch, pretrain_global_energy=pretrain_global_energy)
@@ -210,6 +185,7 @@ def main(unused_argv):
             epochs=FLAGS.pretrain_epoch,
             update_fun=update_pretrain,
             inference_fun=inference_pretrained,
+            optimizer=momentum(0.001, 0.95),
             msg='pretraining feature network'
         ),
         Config(
@@ -217,6 +193,7 @@ def main(unused_argv):
             epochs=FLAGS.energy_pretrain_epoch,
             update_fun=partial(update_ssvm, pretrain_global_energy=True),
             inference_fun=inference,
+            optimizer=momentum(0.001, 0.95),
             msg='pretraining energy network'
         ),
         Config(
@@ -224,11 +201,15 @@ def main(unused_argv):
             epochs=FLAGS.e2e_train_epoch,
             update_fun=update_ssvm,
             inference_fun=inference,
+            optimizer=momentum(0.001, 0.95),
             msg='finetune the entire network end-to-end'
         )
     ]
     best_f1 = 0.
+    params = init_params
     for stage in stages:
+        opt_init, opt_update, get_params = stage.optimizer
+        opt_state = opt_init(params)
         logger.info(stage.msg)
         num_batches = int(onp.ceil(len(train_xs) / stage.batch_size))
         train_stream = data_stream(train_xs, train_ys, batch_size=stage.batch_size, random_seed=FLAGS.random_seed, infty=True)
@@ -242,6 +223,7 @@ def main(unused_argv):
             f1 = evaluate(get_params(opt_state), stage.inference_fun, test_xs, test_ys, batch_size=stage.batch_size)
             if f1 > best_f1:
                 best_f1 = f1
+        params = get_params(opt_state)
     logger.info(f'best F1 score = {best_f1}')
 
 
